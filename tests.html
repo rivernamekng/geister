@@ -1,0 +1,271 @@
+<!doctype html>
+<html lang="ja"><head><meta charset="utf-8"><title>Geister tests</title>
+<style>body{font:14px/1.6 system-ui;padding:16px}.pass{color:#0a0}.fail{color:#c00;font-weight:700}</style>
+</head><body><h1>Geister tests</h1><div id="out"></div>
+<script src="js/rules.js"></script>
+<script src="js/ai.js"></script>
+<script src="js/ui.js"></script>
+<script src="js/firebase-config.js"></script>
+<script src="js/online.js"></script>
+<script>
+var results = [], R = window.GeisterRules;
+function test(name, fn) {
+  try { fn(); results.push([true, name]); }
+  catch (e) { results.push([false, name + ' — ' + e.message]); }
+}
+function eq(a, b, msg) {
+  if (JSON.stringify(a) !== JSON.stringify(b))
+    throw new Error((msg || '') + ' expected ' + JSON.stringify(b) + ' got ' + JSON.stringify(a));
+}
+function ok(v, msg) { if (!v) throw new Error(msg || 'expected truthy'); }
+function throws(fn, msg) {
+  var t = false; try { fn(); } catch (e) { t = true; }
+  if (!t) throw new Error(msg || 'expected throw');
+}
+
+// 標準配置: 前4マスを青、後4マスを赤
+function setupFor(owner, colors) {
+  var sq = R.setupSquares(owner);
+  colors = colors || ['blue','blue','blue','blue','red','red','red','red'];
+  return sq.map(function (p, i) { return { pos: p, color: colors[i] }; });
+}
+function fresh(c0, c1) { return R.createState(setupFor(0, c0), setupFor(1, c1)); }
+
+/* --- 配置 --- */
+test('自陣8マスに8駒が並ぶ', function () {
+  var s = fresh();
+  eq(s.pieces.length, 16);
+  eq(s.board.filter(function (x) { return x !== null; }).length, 16);
+  eq(s.turn, 0);
+});
+test('青が4でないと拒否', function () {
+  throws(function () { fresh(['blue','blue','blue','red','red','red','red','red']); });
+});
+test('駒数が8でないと拒否', function () {
+  throws(function () { R.createState(setupFor(0).slice(0, 7), setupFor(1)); });
+});
+test('自陣外のマスは拒否', function () {
+  var bad = setupFor(0); bad[0] = { pos: [3, 1], color: 'blue' };
+  throws(function () { R.createState(bad, setupFor(1)); });
+});
+
+/* --- 合法手 --- */
+test('初期局面の合法手は8手', function () {
+  var s = fresh();
+  var m = R.legalMoves(s, 0);
+  // row4 の4駒が前進(4) + row4 の両端が横へ(2) + row5 の両端が横へ(2) = 8。
+  // row5 は上を自駒に塞がれ、中央2列は左右も自駒。
+  eq(m.length, 8);
+  ok(m.every(function (x) { return !x.escape; }), '初期に脱出手は無い');
+});
+test('自駒のマスへは動けない', function () {
+  var s = fresh();
+  var m = R.legalMoves(s, 0);
+  ok(m.every(function (x) {
+    var t = R.pieceAt(s, x.to[0], x.to[1]);
+    return !t || t.owner !== 0;
+  }));
+});
+
+/* --- 捕獲 --- */
+test('相手駒を取ると色が公開される', function () {
+  var s = fresh();
+  // player0 の駒を [1,1] の直下 [2,1] に瞬間移動させる（テスト用の直接操作）
+  var p = s.pieces[0];
+  s.board[R.idx(p.pos[0], p.pos[1])] = null;
+  p.pos = [2, 1]; s.board[R.idx(2, 1)] = p.id;
+  var res = R.applyMove(s, { pieceId: p.id, from: [2, 1], to: [1, 1], escape: false });
+  eq(res.capturedColor, 'red', '[1,1] は player1 の後列=赤');
+  eq(res.state.captured[0], ['red']);
+  eq(res.state.turn, 1, '手番が移る');
+});
+
+/* --- 勝利条件 --- */
+test('相手の青を4つ取ったら勝ち', function () {
+  var s = fresh();
+  s.captured[0] = ['blue', 'blue', 'blue'];
+  var p = s.pieces[0];
+  s.board[R.idx(p.pos[0], p.pos[1])] = null;
+  p.pos = [1, 1]; s.board[R.idx(1, 1)] = p.id;
+  // [0,1] は player1 の前列 = 青
+  var res = R.applyMove(s, { pieceId: p.id, from: [1, 1], to: [0, 1], escape: false });
+  eq(res.state.winner, 0);
+  eq(res.state.reason, 'took_all_blue');
+});
+test('自分の赤を4つ取らせたら取らせた側の勝ち', function () {
+  var s = fresh();
+  s.captured[0] = ['red', 'red', 'red'];
+  var p = s.pieces[0];
+  s.board[R.idx(p.pos[0], p.pos[1])] = null;
+  p.pos = [2, 1]; s.board[R.idx(2, 1)] = p.id;
+  // [1,1] は player1 の後列 = 赤。player0 が4つ目の赤を取る → player1 の勝ち
+  var res = R.applyMove(s, { pieceId: p.id, from: [2, 1], to: [1, 1], escape: false });
+  eq(res.state.winner, 1);
+  eq(res.state.reason, 'lost_all_red');
+});
+
+/* --- 脱出 --- */
+test('青駒が相手陣の角にいれば脱出手が出る', function () {
+  var s = fresh();
+  var blue = s.pieces.find(function (p) { return p.owner === 0 && p.color === 'blue'; });
+  s.board[R.idx(blue.pos[0], blue.pos[1])] = null;
+  blue.pos = [0, 0]; s.board[R.idx(0, 0)] = blue.id;
+  var esc = R.legalMoves(s, 0).filter(function (m) { return m.escape; });
+  eq(esc.length, 1);
+  var res = R.applyMove(s, esc[0]);
+  eq(res.state.winner, 0);
+  eq(res.state.reason, 'escape');
+});
+test('赤駒は角にいても脱出できない', function () {
+  var s = fresh();
+  var red = s.pieces.find(function (p) { return p.owner === 0 && p.color === 'red'; });
+  s.board[R.idx(red.pos[0], red.pos[1])] = null;
+  red.pos = [0, 0]; s.board[R.idx(0, 0)] = red.id;
+  eq(R.legalMoves(s, 0).filter(function (m) { return m.escape; }).length, 0);
+});
+test('青駒でも角以外からは脱出できない', function () {
+  var s = fresh();
+  var blue = s.pieces.find(function (p) { return p.owner === 0 && p.color === 'blue'; });
+  s.board[R.idx(blue.pos[0], blue.pos[1])] = null;
+  blue.pos = [0, 2]; s.board[R.idx(0, 2)] = blue.id;
+  eq(R.legalMoves(s, 0).filter(function (m) { return m.escape; }).length, 0);
+});
+test('player1 の脱出口は row5 の両角', function () {
+  var s = fresh();
+  s.turn = 1;
+  var blue = s.pieces.find(function (p) { return p.owner === 1 && p.color === 'blue'; });
+  s.board[R.idx(blue.pos[0], blue.pos[1])] = null;
+  blue.pos = [5, 5]; s.board[R.idx(5, 5)] = blue.id;
+  var esc = R.legalMoves(s, 1).filter(function (m) { return m.escape; });
+  eq(esc.length, 1);
+  eq(R.applyMove(s, esc[0]).state.winner, 1);
+});
+
+/* --- 不変性 --- */
+test('applyMove は元の局面を壊さない', function () {
+  var s = fresh();
+  var before = JSON.stringify(s);
+  R.applyMove(s, R.legalMoves(s, 0)[0]);
+  eq(JSON.stringify(s), before);
+});
+test('不正な手は拒否される', function () {
+  var s = fresh();
+  var p0 = s.pieces[0];
+  // 2マス進む手
+  throws(function () { R.applyMove(s, { pieceId: 0, from: p0.pos, to: [2, 1], escape: false }); }, '2マス移動');
+  // from が実際の位置と食い違う手
+  throws(function () { R.applyMove(s, { pieceId: 0, from: [3, 1], to: [3, 1], escape: false }); }, 'from 不一致');
+  // 相手の手番の駒を動かす手
+  throws(function () { R.applyMove(s, { pieceId: 8, from: s.pieces[8].pos, to: [2, 1], escape: false }); }, '相手駒');
+});
+test('決着後は合法手が無い', function () {
+  var s = fresh(); s.winner = 0;
+  eq(R.legalMoves(s, 0).length, 0);
+});
+
+/* --- AI --- */
+if (window.GeisterAI) {
+  test('AI は合法手を返す', function () {
+    var s = fresh();
+    var mv = window.GeisterAI.chooseMove(s, 0, 'normal');
+    ok(mv, '手が返る');
+    ok(R.legalMoves(s, 0).some(function (m) { return R.sameMove(m, mv); }), '合法手である');
+  });
+  test('AI 同士で対局が決着する', function () {
+    var s = fresh(), guard = 0;
+    while (s.winner === null && guard++ < 400) {
+      var mv = window.GeisterAI.chooseMove(s, s.turn, 'easy');
+      if (!mv) break;
+      s = R.applyMove(s, mv).state;
+    }
+    ok(s.winner !== null || guard >= 400, '進行する');
+    ok(guard > 1, '手が進んでいる');
+  });
+  test('AI は目前の脱出を選ぶ', function () {
+    var s = fresh();
+    var blue = s.pieces.find(function (p) { return p.owner === 0 && p.color === 'blue'; });
+    s.board[R.idx(blue.pos[0], blue.pos[1])] = null;
+    blue.pos = [0, 0]; s.board[R.idx(0, 0)] = blue.id;
+    var mv = window.GeisterAI.chooseMove(s, 0, 'normal');
+    ok(mv.escape, '脱出手を選ぶ');
+  });
+}
+
+/* --- オンライン: 指し手の並べ直し --- */
+if (window.GeisterOnline && window.GeisterOnline.replayFrom) {
+  var replay = window.GeisterOnline.replayFrom;
+  var S0 = setupFor(0), S1 = setupFor(1);
+  // id12 = player1 の (1,1)、後列なので赤
+  var MOVES = [
+    { pieceId: 0,  to: [3, 1], escape: false },
+    { pieceId: 12, to: [2, 1], escape: false },
+    { pieceId: 0,  to: [2, 1], escape: false }   // ここで id12 を捕獲
+  ];
+
+  test('伏せた相手の駒は、色が公開されるまで取れない', function () {
+    var a = replay(S0, 0, MOVES, {});
+    ok(a.blockedOn, '止まっている');
+    eq(a.blockedOn.id, 12);
+    eq(a.state.moveCount, 2, '捕獲の手前まで進む');
+  });
+
+  test('色が公開されれば捕獲まで進む', function () {
+    var a = replay(S0, 0, MOVES, { 12: 'red' });
+    ok(!a.blockedOn, '止まらない');
+    eq(a.state.moveCount, 3);
+    eq(a.state.captured[0], ['red']);
+  });
+
+  test('取られた側は公開を待たずに進める（自分の色は知っているため）', function () {
+    var b = replay(S1, 1, MOVES, {});
+    ok(!b.blockedOn, '止まらない');
+    eq(b.state.moveCount, 3);
+    eq(b.state.captured[0], ['red']);
+  });
+
+  test('両者が同じ盤面にたどり着く', function () {
+    var a = replay(S0, 0, MOVES, { 12: 'red' }).state;
+    var b = replay(S1, 1, MOVES, {}).state;
+    eq(a.board, b.board, '駒の位置が一致');
+    eq(a.turn, b.turn, '手番が一致');
+    eq(a.captured, b.captured, '取った駒が一致');
+    eq(a.winner, b.winner);
+  });
+
+  test('相手の伏せた駒の色は、公開されたものしか分からない', function () {
+    var a = replay(S0, 0, MOVES, { 12: 'red' }).state;
+    var hidden = a.pieces.filter(function (p) {
+      return p.owner === 1 && !p.captured && p.color === R.UNKNOWN;
+    });
+    eq(hidden.length, 7, '捕獲された1体以外は伏せられたまま');
+  });
+
+  test('脱出は色を公開しなくても相手側で再現できる', function () {
+    // 0番(青, (4,1)) を誰もいない0列を通して脱出口 (0,0) まで運ぶ。
+    // 手番を合わせるため、player1 の 13番を (1,2) と (2,2) で往復させる。
+    var mv = [];
+    var path = [[4,0],[3,0],[2,0],[1,0],[0,0]];
+    var filler = [[2,2],[1,2],[2,2],[1,2],[2,2]];
+    for (var i = 0; i < path.length; i++) {
+      mv.push({ pieceId: 0, to: path[i], escape: false });
+      mv.push({ pieceId: 13, to: filler[i], escape: false });
+    }
+    mv.push({ pieceId: 0, to: null, escape: true });
+    var a = replay(setupFor(0), 0, mv, {});
+    var b = replay(setupFor(1), 1, mv, {});
+    ok(!a.blockedOn && !b.blockedOn, '両者とも止まらない');
+    eq(a.state.winner, 0, '自分側で勝ちになる');
+    eq(b.state.winner, 0, '相手側でも同じ結果');
+    eq(b.state.reason, 'escape');
+  });
+}
+
+var pass = results.filter(function (r) { return r[0]; }).length;
+document.getElementById('out').innerHTML =
+  '<h2>' + pass + ' / ' + results.length + ' passed</h2>' +
+  results.map(function (r) {
+    return '<div class="' + (r[0] ? 'pass' : 'fail') + '">' + (r[0] ? 'PASS' : 'FAIL') + ' — ' + r[1] + '</div>';
+  }).join('');
+console.log('RESULT ' + pass + '/' + results.length);
+results.filter(function (r) { return !r[0]; }).forEach(function (r) { console.log('FAIL ' + r[1]); });
+</script></body></html>
