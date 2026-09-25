@@ -194,6 +194,70 @@ function guestWrites(sub, value) { DB.write('rooms/' + code() + '/' + sub, value
     eq(A.state.captured[1], ['blue']);
   });
 
+  // --- 再戦: 相手が「先攻後攻を交代して再戦」を申し込み、こちらが受ける ---
+  var oldCode = code();
+  guestWrites('meta/rematch', { by: 1, swap: true });
+  await wait();
+
+  check('相手の再戦の申し込みが届く', function () {
+    var t = O.rematchView().textContent;
+    ok(t.indexOf('相手が再戦を申し込んでいます') >= 0, t);
+    ok(t.indexOf('後攻') >= 0, '次は後攻だと分かる: ' + t);
+  });
+
+  O.acceptRematch();
+  await wait(); await wait();
+
+  check('受けると新しい部屋に移り、先攻後攻が入れ替わる', function () {
+    ok(code() !== oldCode, '部屋が変わる');
+    eq(DB.read('rooms/' + oldCode + '/meta/next'), code(), '元の部屋に行き先が書かれる');
+    eq(room('meta').host, 'uid-guest');
+    eq(room('meta').guest, 'uid-host');
+    eq(O.state.role, 1);
+    eq(A.myPlayer, 1);
+    eq(A.view, 'setup');
+    eq(A.setupOwner, 1, '後攻側の陣で配置する');
+  });
+
+  O.submitSetup(setupFor(1));
+  guestWrites('ready/0', true);
+  await wait();
+
+  check('交代後は相手の先攻で始まる', function () {
+    eq(A.view, 'play');
+    eq(A.state.turn, 0);
+    ok(A.state.turn !== A.myPlayer, '相手の番から');
+    eq(A.state.pieces[8].color, 'blue', '自分の色は分かる');
+    eq(A.state.pieces[0].color, 'unknown', '相手の色は伏せられている');
+  });
+
+  // --- 再戦: こちらから「同じ先後で再戦」を申し込み、相手が受ける ---
+  O.requestRematch(false);
+  await wait();
+
+  check('こちらの申し込みが書かれ、返事待ちになる', function () {
+    eq(room('meta').rematch, { by: 1, swap: false });
+    ok(O.rematchView().textContent.indexOf('相手の返事を待っています') >= 0);
+  });
+
+  DB.write('rooms/NEXT22/meta', { host: 'uid-guest', guest: 'uid-host', createdAt: 1 });
+  guestWrites('meta/next', 'NEXT22');
+  await wait();
+
+  check('相手が受けると、こちらも新しい部屋に移る', function () {
+    eq(code(), 'NEXT22');
+    eq(O.state.role, 1, '先後はそのまま');
+    eq(A.view, 'setup');
+  });
+
+  // --- 相手が退出 ---
+  guestWrites('meta/left/0', true);
+  await wait();
+
+  check('相手が退出したら分かる', function () {
+    ok(O.rematchView().textContent.indexOf('相手は退出しました') >= 0);
+  });
+
   var pass = results.filter(function (r) { return r[0]; }).length;
   document.getElementById('out').innerHTML =
     '<h2>' + pass + ' / ' + results.length + ' passed</h2>' +

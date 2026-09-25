@@ -2,8 +2,10 @@
 (function () {
   'use strict';
   var R = window.GeisterRules, AI = window.GeisterAI, U = window.GeisterUI;
+  var S = window.GeisterSound || { play: function () {}, bgm: function () {}, setTension: function () {} };
   var screen = document.getElementById('screen');
   var statusEl = document.getElementById('status');
+  var soundEl = document.getElementById('sound');
 
   var LEVEL_LABEL = { easy: 'やさしい', normal: 'ふつう', hard: 'つよい' };
   var REASON = {
@@ -25,13 +27,65 @@
     moves: [],
     thinking: false,
     nextAfterCurtain: null,
-    curtainText: ''
+    curtainText: '',
+    playing: false       // 対局中か（1台対戦の目隠し画面でも BGM を止めないため）
   };
   window.GeisterApp = app;
 
   /* ---------- 共通 ---------- */
 
   function go(view) { app.view = view; render(); }
+
+  // 局面を差し替え、直前の局面との差から何が起きたかを判断して音を鳴らす。
+  // オンラインでは受信のたびに局面を作り直すので、手数が進んだときだけ鳴らす。
+  function setState(s) {
+    var prev = app.state;
+    app.state = s;
+    if (prev && s && s.moveCount > prev.moveCount && s.moveCount - prev.moveCount <= 2) cue(prev, s);
+  }
+
+  function cue(prev, s) {
+    var me = app.myPlayer;
+    var escaped = s.pieces.some(function (p, i) { return p.escaped && !prev.pieces[i].escaped; });
+    var took = [0, 1].map(function (p) { return s.captured[p].length - prev.captured[p].length; });
+    if (escaped) S.play('escape');
+    else if (took[0] || took[1]) S.play(app.mode === 'local' || took[me] ? 'capture' : 'lost');
+    else S.play('move');
+    if (s.winner !== null && prev.winner === null) {
+      S.play(app.mode === 'local' || s.winner === me ? 'win' : 'lose', 0.35);
+    }
+  }
+
+  // BGM の緊迫度（0〜1）。位置と公開済みの色だけで決め、伏せた色は使わない。
+  function tensionOf(s) {
+    var near = 9;
+    s.pieces.forEach(function (p) {
+      if (p.captured || p.escaped) return;
+      [[0, 0], [0, 5], [5, 0], [5, 5]].forEach(function (q) {
+        if (R.isEscapeSquare(p.owner, q[0], q[1])) {
+          near = Math.min(near, Math.abs(p.pos[0] - q[0]) + Math.abs(p.pos[1] - q[1]));
+        }
+      });
+    });
+    var edge = 0;
+    s.captured.forEach(function (list) {
+      var blue = list.filter(function (c) { return c === R.BLUE; }).length;
+      edge = Math.max(edge, blue, list.length - blue);
+    });
+    return Math.min(1, Math.max((3 - near) / 3, edge / 3 * 0.9, s.moveCount / 80));
+  }
+
+  function renderSoundToggles() {
+    if (!soundEl || !window.GeisterSound) return;
+    U.clear(soundEl);
+    [['se', '効果音'], ['bgm', 'BGM']].forEach(function (k) {
+      var on = S.prefs()[k[0]];
+      var b = U.el('button', 'snd' + (on ? ' on' : ''), k[1]);
+      b.setAttribute('aria-pressed', on ? 'true' : 'false');
+      b.addEventListener('click', function () { S.toggle(k[0]); renderSoundToggles(); });
+      soundEl.appendChild(b);
+    });
+  }
 
   // この端末が今操作してよいプレイヤー。操作できないときは null。
   function controller() {
@@ -111,6 +165,7 @@
   /* ---------- 配置 ---------- */
 
   function startSetup(owner) {
+    app.playing = false;
     app.setupOwner = owner;
     app.setupColors = {};
     setupDisplayOrder(owner).forEach(function (p, i) {
@@ -132,6 +187,9 @@
     var who = app.mode === 'local' ? 'プレイヤー' + (owner + 1) + 'の配置' : 'おばけを配置';
     card.appendChild(U.el('h2', null, who));
     card.appendChild(U.el('p', 'muted', 'タップで青（良い）と赤（悪い）を切り替えます。上の列が前線です。'));
+    if (app.mode !== 'local') {
+      card.appendChild(U.el('p', 'turn-note', owner === 0 ? 'あなたは先攻です' : 'あなたは後攻です（相手から動きます）'));
+    }
 
     var grid = U.el('div', 'setup-grid');
     setupDisplayOrder(owner).forEach(function (p) {
@@ -171,7 +229,7 @@
       return { pos: p, color: app.setupColors[R.idx(p[0], p[1])] };
     });
     if (app.mode === 'cpu') {
-      app.setups[1] = AI.chooseSetup(1);
+      app.setups[1 - owner] = AI.chooseSetup(1 - owner);
       beginGame();
     } else if (app.mode === 'local') {
       if (owner === 0) curtain('プレイヤー2に渡してください', function () { startSetup(1); });
@@ -184,6 +242,10 @@
   function beginGame() {
     app.state = R.createState(app.setups[0], app.setups[1]);
     app.selected = null; app.moves = [];
+    app.playing = true;
+    S.play('start');
+    // CPU が先攻のときは、そのまま CPU の手番を回す
+    if (app.mode === 'cpu' && app.state.turn !== app.myPlayer) { afterMove(); return; }
     skipIfStuck();
     go('play');
   }
@@ -248,6 +310,7 @@
     if (p && p.owner === ctl) {
       app.selected = p.id;
       app.moves = R.legalMoves(s, ctl).filter(function (m) { return m.pieceId === p.id; });
+      S.play('select');
       render();
       return;
     }
@@ -268,7 +331,7 @@
       render();
       return;
     }
-    app.state = R.applyMove(app.state, move).state;
+    setState(R.applyMove(app.state, move).state);
     app.selected = null; app.moves = [];
     afterMove();
   }
@@ -294,7 +357,7 @@
         var mv = AI.chooseMove(app.state, app.state.turn, app.level);
         app.thinking = false;
         if (!mv) { go('result'); return; }
-        app.state = R.applyMove(app.state, mv).state;
+        setState(R.applyMove(app.state, mv).state);
         afterMove();
       }, 260);
       return;
@@ -339,19 +402,30 @@
     });
     c.appendChild(rev);
 
-    var again = U.el('div', 'row');
-    again.style.marginTop = '16px';
-    if (app.mode !== 'online') {
+    if (app.mode === 'online' && window.GeisterOnline) {
+      c.appendChild(window.GeisterOnline.rematchView());
+    } else {
+      var again = U.el('div', 'row');
+      again.style.marginTop = '16px';
       again.appendChild(U.button('もう一度', 'primary small', function () {
         app.setups = [null, null];
-        startSetup(0);
+        startSetup(app.mode === 'cpu' ? app.myPlayer : 0);
       }));
+      if (app.mode === 'cpu') {
+        again.appendChild(U.button('先攻後攻を交代', 'small', function () {
+          app.myPlayer = 1 - app.myPlayer;
+          app.setups = [null, null];
+          startSetup(app.myPlayer);
+        }));
+      }
+      c.appendChild(again);
     }
-    again.appendChild(U.button('メニューへ', 'small', function () {
+    var back = U.button('メニューへ', 'ghost small', function () {
       if (app.mode === 'online' && window.GeisterOnline) window.GeisterOnline.leave();
       go('menu');
-    }));
-    c.appendChild(again);
+    });
+    back.style.marginTop = '10px';
+    c.appendChild(back);
     return c;
   }
 
@@ -387,6 +461,11 @@
     }
     screen.appendChild(node);
     statusEl.textContent = statusText();
+
+    var inGame = !!app.state && app.state.winner === null &&
+      (app.view === 'play' || (app.view === 'curtain' && app.playing));
+    if (inGame) S.setTension(tensionOf(app.state));
+    S.bgm(inGame);
   }
 
   // オンライン側から呼ぶための入口
@@ -397,6 +476,9 @@
   app.curtain = curtain;
   app.afterMove = afterMove;
   app.skipIfStuck = skipIfStuck;
+  app.setState = setState;
+  app.sound = S;
 
+  renderSoundToggles();
   render();
 })();

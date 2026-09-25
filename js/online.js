@@ -117,7 +117,9 @@
       var meta = snap.val();
       if (!meta) throw new Error('その部屋は見つかりません');
       if (meta.host === st.uid) { st.role = 0; return null; }
-      if (meta.guest && meta.guest !== st.uid) throw new Error('その部屋はもう埋まっています');
+      if (meta.guest === st.uid) { st.role = 1; return null; }
+      if (meta.guest) throw new Error('その部屋はもう埋まっています');
+      if (meta.left) throw new Error('その部屋は閉じられています');
       st.role = 1;
       return roomRef('meta/guest').set(st.uid);
     }).then(function () {
@@ -138,6 +140,10 @@
   }
 
   function leave() {
+    // 再戦を待っている相手に、もう戻らないことを知らせる
+    if (st.db && st.code && st.role !== null) {
+      roomRef('meta/left/' + st.role).set(true).catch(function () {});
+    }
     if (st.ref) { st.ref.off(); st.ref = null; }
     st.code = null; st.role = null; st.mySetup = null;
     st.room = {}; st.askedSetup = false; st.blockedOn = null; st.mismatch = false;
@@ -251,6 +257,77 @@
     return true;
   }
 
+  /* ---------- 再戦 ----------
+     同じ部屋は使い回さず、新しい部屋を作って二人で移る。
+     先攻は部屋の host（role 0）なので、先攻後攻の交代は host と guest を入れ替えて作るだけで済む。
+     書き込むのは meta の下だけなので、データベースのルールは変えなくてよい。 */
+
+  function requestRematch(swap) {
+    roomRef('meta/rematch').set({ by: st.role, swap: !!swap }).catch(fail);
+  }
+
+  function cancelRematch() {
+    roomRef('meta/rematch').set(null).catch(fail);
+  }
+
+  function acceptRematch() {
+    var meta = st.room.meta || {}, req = meta.rematch;
+    if (!req || meta.next) return;
+    var code = makeCode();
+    st.db.ref('rooms/' + code + '/meta').set({
+      host: req.swap ? meta.guest : meta.host,
+      guest: req.swap ? meta.host : meta.guest,
+      createdAt: Date.now()
+    }).then(function () {
+      return roomRef('meta/next').set(code);  // これを見て二人とも新しい部屋へ移る
+    }).catch(fail);
+  }
+
+  function switchRoom(code) {
+    if (st.ref) { st.ref.off(); st.ref = null; }
+    st.code = code;
+    st.role = null;  // 新しい部屋の meta を見て決める
+    st.mySetup = null; st.room = {};
+    st.askedSetup = false; st.blockedOn = null; st.mismatch = false;
+    restoreSetup();
+    watch();
+  }
+
+  function youAre(role) { return role === 0 ? '先攻' : '後攻'; }
+
+  function rematchView() {
+    var box = U.el('div', 'card rematch');
+    var meta = st.room.meta || {}, req = meta.rematch, left = meta.left || {};
+
+    if (left[1 - st.role]) {
+      box.appendChild(U.el('p', 'muted', '相手は退出しました'));
+      return box;
+    }
+    if (meta.next) {
+      box.appendChild(U.el('p', 'muted', '次の対局を準備しています…'));
+      return box;
+    }
+    if (!req) {
+      box.appendChild(U.el('h2', null, 'もう一戦する？'));
+      var row = U.el('div', 'row');
+      row.appendChild(U.button('再戦する', 'primary small', function () { requestRematch(false); }));
+      row.appendChild(U.button('先攻後攻を交代して再戦', 'small', function () { requestRematch(true); }));
+      box.appendChild(row);
+      box.appendChild(U.el('p', 'muted', '今回あなたは' + youAre(st.role) + 'でした'));
+    } else if (req.by === st.role) {
+      box.appendChild(U.el('h2', null, req.swap ? '先攻後攻を交代して再戦を申し込みました' : '再戦を申し込みました'));
+      box.appendChild(U.el('p', 'muted', '相手の返事を待っています…'));
+      box.appendChild(U.button('取り消す', 'ghost small', cancelRematch));
+    } else {
+      var next = req.swap ? 1 - st.role : st.role;
+      box.appendChild(U.el('h2', null, '相手が再戦を申し込んでいます'));
+      box.appendChild(U.el('p', 'muted',
+        (req.swap ? '先攻後攻を交代します。' : '先攻後攻はそのままです。') + '次はあなたが' + youAre(next) + 'です'));
+      box.appendChild(U.button('受けて始める', 'primary', acceptRematch));
+    }
+    return box;
+  }
+
   /* ---------- 進行 ---------- */
 
   function sync() {
@@ -258,6 +335,14 @@
     if (a.mode !== 'online' || !st.code) return;
     var meta = st.room.meta || {};
     var ready = st.room.ready || {};
+
+    if (meta.next && meta.next !== st.code) { switchRoom(meta.next); return; }
+    if (st.role === null) {
+      if (meta.host && meta.host === st.uid) st.role = 0;
+      else if (meta.guest && meta.guest === st.uid) st.role = 1;
+      else return;
+      a.myPlayer = st.role;
+    }
 
     if (!meta.host || !meta.guest) { a.go('online-wait'); return; }
 
@@ -273,12 +358,15 @@
     if (s.winner !== null) {
       publishFinal();
       applyFinal(s);
-      a.state = s;
+      a.setState(s);
       a.go('result');
       return;
     }
-    a.state = s;
-    if (a.view !== 'play') { a.selected = null; a.moves = []; }
+    a.setState(s);
+    if (a.view !== 'play') {
+      a.selected = null; a.moves = [];
+      if (s.moveCount === 0) a.sound.play('start');
+    }
     a.go('play');
   }
 
@@ -368,6 +456,9 @@
     replayFrom: replayFrom,
     waitingNote: waitingNote,
     mismatchNote: mismatchNote,
+    rematchView: rematchView,
+    requestRematch: requestRematch,
+    acceptRematch: acceptRematch,
     state: st
   };
 
