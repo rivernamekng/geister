@@ -1,5 +1,5 @@
 window.GeisterFirebaseConfig = {
-  apiKey: 'AIzaSyCR•••••••••••••••••••••••••••••••',
+  apiKey: 'AIzaSyCRCQi0IoucY8jwgDRDogKnr8_lpGtOWKY',
   authDomain: 'geister-6d6cf.firebaseapp.com',
   databaseURL: 'https://geister-6d6cf-default-rtdb.asia-southeast1.firebasedatabase.app',
   projectId: 'geister-6d6cf',
