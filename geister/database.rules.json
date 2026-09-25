@@ -1,0 +1,19 @@
+{
+  "rules": {
+    "rooms": {
+      "$code": {
+        ".read": "auth != null",
+
+        "meta": {
+          ".write": "auth != null && (!data.exists() || !data.child('guest').exists() || data.child('host').val() === auth.uid || data.child('guest').val() === auth.uid)",
+          ".validate": "newData.hasChild('host')"
+        },
+
+        "ready":   { ".write": "auth != null && (root.child('rooms').child($code).child('meta/host').val() === auth.uid || root.child('rooms').child($code).child('meta/guest').val() === auth.uid)" },
+        "moves":   { ".write": "auth != null && (root.child('rooms').child($code).child('meta/host').val() === auth.uid || root.child('rooms').child($code).child('meta/guest').val() === auth.uid)" },
+        "reveals": { ".write": "auth != null && (root.child('rooms').child($code).child('meta/host').val() === auth.uid || root.child('rooms').child($code).child('meta/guest').val() === auth.uid)" },
+        "final":   { ".write": "auth != null && (root.child('rooms').child($code).child('meta/host').val() === auth.uid || root.child('rooms').child($code).child('meta/guest').val() === auth.uid)" }
+      }
+    }
+  }
+}

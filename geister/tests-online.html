@@ -1,0 +1,206 @@
+<!doctype html>
+<html lang="ja"><head><meta charset="utf-8"><title>Geister online tests</title>
+<link rel="stylesheet" href="css/style.css">
+<style>#out{padding:16px;font:14px/1.7 system-ui}.pass{color:#3ddc97}.fail{color:#ff5d6c;font-weight:700}</style>
+</head><body>
+<div id="out">実行中…</div>
+
+<!-- アプリ本体と同じ構成で読み込む。画面は隠しておく。 -->
+<div id="app" style="display:none">
+  <header id="topbar"><h1>ガイスター</h1><div id="status"></div></header>
+  <main id="screen"></main>
+</div>
+
+<script src="js/rules.js"></script>
+<script src="js/ai.js"></script>
+<script src="js/ui.js"></script>
+<script src="js/firebase-config.js"></script>
+<script src="js/online.js"></script>
+<script src="js/main.js"></script>
+
+<script>
+/* Firebase の代わりになる、メモリ上の小さなデータベース。
+   online.js が本物に対して何を読み書きするかを、そのまま確かめるために使う。 */
+(function () {
+  var store = {}, listeners = [];
+
+  function split(path) { return path.split('/').filter(Boolean); }
+
+  function readPath(path) {
+    var node = store, parts = split(path);
+    for (var i = 0; i < parts.length; i++) {
+      if (node === null || typeof node !== 'object') return null;
+      node = node[parts[i]];
+      if (node === undefined) return null;
+    }
+    return node === undefined ? null : node;
+  }
+
+  function writePath(path, value) {
+    var parts = split(path), node = store;
+    for (var i = 0; i < parts.length - 1; i++) {
+      if (typeof node[parts[i]] !== 'object' || node[parts[i]] === null) node[parts[i]] = {};
+      node = node[parts[i]];
+    }
+    node[parts[parts.length - 1]] = value;
+    notify();
+  }
+
+  function notify() {
+    listeners.slice().forEach(function (l) {
+      l.cb({ val: function () { return clone(readPath(l.path)); } });
+    });
+  }
+  function clone(v) { return v === null ? null : JSON.parse(JSON.stringify(v)); }
+
+  function ref(path) {
+    return {
+      set: function (v) { writePath(path, v); return Promise.resolve(); },
+      get: function () { return Promise.resolve({ val: function () { return clone(readPath(path)); } }); },
+      on: function (evt, cb) { var l = { path: path, cb: cb }; listeners.push(l); this._l = l; cb({ val: function () { return clone(readPath(path)); } }); },
+      off: function () { listeners = listeners.filter(function (x) { return x !== this._l; }.bind(this)); }
+    };
+  }
+
+  window.firebase = {
+    apps: [],
+    initializeApp: function () { window.firebase.apps.push({}); },
+    auth: function () {
+      return { signInAnonymously: function () { return Promise.resolve({ user: { uid: 'uid-host' } }); } };
+    },
+    database: function () { return { ref: ref }; }
+  };
+  window.__fakeDb = { store: store, read: readPath, write: writePath };
+})();
+
+/* --- テスト --- */
+var R = window.GeisterRules, A = window.GeisterApp, O = window.GeisterOnline, DB = window.__fakeDb;
+var results = [];
+function check(name, fn) {
+  try { fn(); results.push([true, name]); }
+  catch (e) { results.push([false, name + ' — ' + e.message]); }
+}
+function eq(a, b, m) {
+  if (JSON.stringify(a) !== JSON.stringify(b))
+    throw new Error((m || '') + ' expected ' + JSON.stringify(b) + ' got ' + JSON.stringify(a));
+}
+function ok(v, m) { if (!v) throw new Error(m || 'expected truthy'); }
+function wait() { return new Promise(function (r) { setTimeout(r, 0); }); }
+
+function setupFor(owner, colors) {
+  var sq = R.setupSquares(owner);
+  colors = colors || ['blue', 'blue', 'blue', 'blue', 'red', 'red', 'red', 'red'];
+  return sq.map(function (p, i) { return { pos: p, color: colors[i] }; });
+}
+function code() { return O.state.code; }
+function room(sub) { return DB.read('rooms/' + code() + (sub ? '/' + sub : '')); }
+// 相手の端末がする書き込みを、テストから代わりに行う
+function guestWrites(sub, value) { DB.write('rooms/' + code() + '/' + sub, value); }
+
+(async function run() {
+  try { localStorage.removeItem('geister.setup.' + 'x'); } catch (e) {}
+
+  O.openLobby();
+  await wait();
+
+  check('ロビーを開くと匿名でサインインする', function () {
+    ok(O.state.ready, '接続済み');
+    eq(O.state.uid, 'uid-host');
+  });
+
+  O.state.mySetup = null;
+  document.querySelectorAll('button').forEach(function (b) {
+    if (b.textContent.indexOf('部屋を作る') >= 0) b.click();
+  });
+  await wait(); await wait();
+
+  check('部屋を作ると6文字のコードと host が書かれる', function () {
+    ok(code() && code().length === 6, 'コードが6文字: ' + code());
+    eq(room('meta').host, 'uid-host');
+    eq(O.state.role, 0);
+    eq(A.view, 'online-wait', '相手待ち画面');
+  });
+
+  // --- 相手が参加 ---
+  guestWrites('meta/guest', 'uid-guest');
+  await wait();
+
+  check('相手が入ると配置画面に進む', function () {
+    eq(A.view, 'setup');
+    eq(A.myPlayer, 0);
+  });
+
+  // --- 自分の配置を確定 ---
+  var mySetup = setupFor(0);
+  O.submitSetup(mySetup);
+  await wait();
+
+  check('配置を出しても色はサーバーに送られない', function () {
+    eq(room('ready'), { 0: true }, '合図だけが書かれる');
+    var dump = JSON.stringify(room());
+    ok(dump.indexOf('blue') < 0 && dump.indexOf('red') < 0, '色がどこにも無い: ' + dump);
+    eq(A.view, 'online-setupwait');
+  });
+
+  // --- 相手も配置完了 ---
+  guestWrites('ready/1', true);
+  await wait();
+
+  check('両者そろうと対局が始まる', function () {
+    eq(A.view, 'play');
+    eq(A.state.turn, 0, '部屋を作った側が先手');
+    eq(A.state.pieces[0].color, 'blue', '自分の色は分かる');
+    eq(A.state.pieces[8].color, 'unknown', '相手の色は伏せられている');
+  });
+
+  // --- 自分が一手指す ---
+  O.sendMove({ pieceId: 0, from: [4, 1], to: [3, 1], escape: false });
+  await wait();
+
+  check('指し手が共有され、盤面に反映される', function () {
+    eq(room('moves')[0], { pieceId: 0, to: [3, 1], escape: false });
+    eq(A.state.pieces[0].pos, [3, 1]);
+    eq(A.state.turn, 1, '手番が相手に移る');
+  });
+
+  // --- 相手が自分の駒を取る ---
+  guestWrites('moves/1', { pieceId: 12, to: [2, 1], escape: false }); // (1,1)->(2,1)
+  await wait();
+  O.sendMove({ pieceId: 0, from: [3, 1], to: [2, 1], escape: false }); // 相手の駒を取る
+  await wait();
+
+  check('伏せた相手の駒を取ると、色が公開されるまで止まる', function () {
+    eq(A.state.moveCount, 2, '捕獲の手前で止まっている');
+    ok(O.state.blockedOn, '待ちが立っている');
+    eq(O.state.blockedOn.id, 12);
+    ok(O.waitingNote().length > 0, '待ちの表示が出る');
+  });
+
+  guestWrites('reveals/12', 'red');
+  await wait();
+
+  check('相手が色を明かすと捕獲が成立する', function () {
+    eq(A.state.moveCount, 3);
+    eq(A.state.captured[0], ['red']);
+    ok(!O.state.blockedOn, '待ちが解ける');
+  });
+
+  // --- 自分の駒が取られたら、自分から色を明かす ---
+  guestWrites('moves/3', { pieceId: 13, to: [2, 1], escape: false }); // 自分の 0番 を取る
+  await wait(); await wait();
+
+  check('自分の駒が取られたら、こちらから色を明かす', function () {
+    eq(room('reveals')[0], 'blue', '0番は青なので blue が公開される');
+    eq(A.state.captured[1], ['blue']);
+  });
+
+  var pass = results.filter(function (r) { return r[0]; }).length;
+  document.getElementById('out').innerHTML =
+    '<h2>' + pass + ' / ' + results.length + ' passed</h2>' +
+    results.map(function (r) {
+      return '<div class="' + (r[0] ? 'pass' : 'fail') + '">' + (r[0] ? 'PASS' : 'FAIL') + ' — ' + r[1] + '</div>';
+    }).join('') +
+    '<pre style="color:#939db5;font-size:11px">' + JSON.stringify(room(), null, 1) + '</pre>';
+})();
+</script>
+</body></html>
