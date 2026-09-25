@@ -4,9 +4,12 @@
   'use strict';
   var KEY = 'geister.sound';
   var BGM_LEVEL = 0.32;
+  // 音符は音声スレッドが時刻どおりに鳴らすので、先まで予約しておけば
+  // CPU の思考や描画で画面側が固まっても BGM は途切れない。
+  var LOOKAHEAD = 1.0;
 
   var prefs = loadPrefs();
-  var ctx = null, seBus = null, bgmBus = null, noiseBuf = null;
+  var ctx = null, comp = null, seBus = null, bgmBus = null, noiseBuf = null;
   var bgmWanted = false, running = false, timer = null;
   var nextTime = 0, step = 0;
   var tension = 0, tensionTarget = 0;
@@ -25,10 +28,9 @@
     var AC = global.AudioContext || global.webkitAudioContext;
     if (!AC) return null;
     ctx = new AC();
-    var comp = ctx.createDynamicsCompressor();
+    comp = ctx.createDynamicsCompressor();
     comp.connect(ctx.destination);
     seBus = ctx.createGain(); seBus.gain.value = 0.6; seBus.connect(comp);
-    bgmBus = ctx.createGain(); bgmBus.gain.value = 0; bgmBus.connect(comp);
     noiseBuf = ctx.createBuffer(1, ctx.sampleRate, ctx.sampleRate);
     var d = noiseBuf.getChannelData(0);
     for (var i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
@@ -182,36 +184,40 @@
   }
 
   function tick() {
-    if (!ctx || ctx.state !== 'running') return;
-    if (nextTime < ctx.currentTime) nextTime = ctx.currentTime + 0.05;
-    while (nextTime < ctx.currentTime + 0.15) {
+    if (!ctx || ctx.state !== 'running' || !running) return;
+    var now = ctx.currentTime;
+    // 画面側が長く固まって予約が尽きたときは、拍を数え進めて曲の流れを保ったまま追いつく
+    while (nextTime < now) { nextTime += stepDur(); step = (step + 1) % 64; }
+    while (nextTime < now + LOOKAHEAD) {
       scheduleStep(step, nextTime);
       nextTime += stepDur();
       step = (step + 1) % 64;
     }
   }
 
-  function fadeTo(v, sec) {
-    var now = ctx.currentTime;
-    bgmBus.gain.cancelScheduledValues(now);
-    bgmBus.gain.setValueAtTime(bgmBus.gain.value, now);
-    bgmBus.gain.linearRampToValueAtTime(v, now + sec);
-  }
-
   function refreshBgm() {
     var on = bgmWanted && prefs.bgm && !!ctx && ctx.state === 'running';
+    var now = ctx ? ctx.currentTime : 0;
     if (on && !running) {
+      // 止めるたびに出力先を作り直す。先まで予約した古い音符を、再開時に鳴らさないため。
+      bgmBus = ctx.createGain();
+      bgmBus.gain.setValueAtTime(0, now);
+      bgmBus.gain.linearRampToValueAtTime(BGM_LEVEL, now + 0.6);
+      bgmBus.connect(comp);
       running = true;
       step = 0;
-      nextTime = ctx.currentTime + 0.08;
-      fadeTo(BGM_LEVEL, 0.6);
-      timer = setInterval(tick, 25);
+      nextTime = now + 0.08;
+      timer = setInterval(tick, 100);
       tick();
     } else if (!on && running) {
       running = false;
       clearInterval(timer);
       timer = null;
-      if (ctx) fadeTo(0, 0.4);
+      var old = bgmBus;
+      old.gain.cancelScheduledValues(now);
+      old.gain.setValueAtTime(old.gain.value, now);
+      old.gain.linearRampToValueAtTime(0, now + 0.4);
+      setTimeout(function () { old.disconnect(); }, (LOOKAHEAD + 1) * 1000);
     }
   }
 
